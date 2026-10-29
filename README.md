@@ -44,12 +44,16 @@ Every upgrade is rebuilt from this repo, verified with `solana-verify` (below), 
 
 ## Rebuild the program and compare it with the one on chain
 
-You need Docker and [`solana-verify`](https://github.com/Ellipsis-Labs/solana-verifiable-build) (`cargo install solana-verify`). A plain `cargo build-sbf` gives the
-same file only with the same Solana toolchain as ours; `solana-verify build` builds inside a pinned container, so everyone gets the same file whatever their machine.
+You need Docker and [`solana-verify`](https://github.com/Ellipsis-Labs/solana-verifiable-build) (`cargo install solana-verify`). The program on chain is the container's
+build: `solana-verify build` builds inside a pinned container, so everyone gets the same file whatever their machine, while a plain `cargo build-sbf` gives a
+file that differs with the machine and toolchain (fine for the tests, not for this comparison).
+
+The program is built with Solana 3.1.11, so name that container: `solana-verify`'s default pick for this code is an older one whose Cargo cannot build
+it (it stops on `edition2024`).
 
 ```
 cd programs/souvenir-swap
-solana-verify build --library-name souvenir_swap
+solana-verify build --library-name souvenir_swap --base-image solanafoundation/solana-verifiable-build:3.1.11
 solana-verify get-executable-hash target/deploy/souvenir_swap.so
 solana-verify get-program-hash --url https://api.mainnet-beta.solana.com 42Ft9ioktrSK4zLpnqDFgNDdFoYZHQmUhgYothhNCN6J
 ```
@@ -58,8 +62,11 @@ The last two lines must print the same hash. To have `solana-verify` do the whol
 
 ```
 solana-verify verify-from-repo --url https://api.mainnet-beta.solana.com --program-id 42Ft9ioktrSK4zLpnqDFgNDdFoYZHQmUhgYothhNCN6J \
-  --mount-path programs/souvenir-swap --library-name souvenir_swap https://github.com/Souvenir-finance/Swap
+  --mount-path programs/souvenir-swap --library-name souvenir_swap \
+  --base-image solanafoundation/solana-verifiable-build:3.1.11 https://github.com/Souvenir-finance/Swap
 ```
+
+On a Mac with Apple silicon Docker runs this x86 container under emulation; it works, only slower.
 
 (`solana-verify <command> --help` is the reference if a flag has moved.)
 
