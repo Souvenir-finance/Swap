@@ -162,6 +162,6 @@ Token-2022 new mint (pump.fun's).
 - `programs/souvenir-swap`: the program (`src/lib.rs`) and its tests.
 - `src/holderswap.mjs`: the instructions, the accounts' layout and the snapshot's tree. `src/merkle.mjs`: the tree itself (`tree` and `verify`, unchanged from
   Souvenir's source). `src/snapshot.mjs` and `src/locks.mjs`: how the snapshot is read from the chain (`locks.mjs` is the part of Souvenir's staking code that reads a lock).
-- `scripts/migration.mjs`: the owner's two commands, `snapshot` and `open`.
+- `scripts/migration.mjs`: the owner's commands, `snapshot`, `open` and `topup` (which adds new tokens to the vault).
 
 Some comments in these files mention Souvenir's app files (`src/tickets.mjs`, `src/stake.mjs`) and its design notes (`docs/specs/…`), which are not in this repo. The parts of the app files that the snapshot needs are `src/merkle.mjs` and `src/locks.mjs` here.
