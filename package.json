@@ -1,0 +1,19 @@
+{
+  "name": "souvenir-swap",
+  "private": true,
+  "type": "module",
+  "description": "Souvenir holder swap: the program, its tests, and the tools that build and check the snapshot it is based on",
+  "scripts": {
+    "test": "node --test programs/souvenir-swap/tests/*.test.mjs"
+  },
+  "dependencies": {
+    "@solana/web3.js": "1.98.4",
+    "@solana/spl-token": "0.4.14"
+  },
+  "devDependencies": {
+    "litesvm": "0.3.3"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  }
+}

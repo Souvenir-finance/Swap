@@ -1,0 +1,29 @@
+[package]
+name = "souvenir-swap"
+version = "0.1.0"
+edition = "2021"
+description = "Souvenir's holder swap: old $SOUVENIR in, new $SOUVENIR out at a fixed rate, capped by a Merkle snapshot of old balances (docs/specs/2026-10-28-token-migration.md)"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "souvenir_swap"
+
+[features]
+default = []
+no-entrypoint = []
+cpi = ["no-entrypoint"]
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+anchor-debug = []
+custom-heap = []
+custom-panic = []
+
+[dependencies]
+anchor-lang = { version = "0.32.1", features = ["init-if-needed"] }
+anchor-spl = { version = "0.32.1", default-features = false, features = ["token", "token_2022", "associated_token"] }
+# solana_program::hash::hashv is this crate's hashv (anchor-lang 0.32 does not re-export solana_program::hash); already in the lock.
+solana-sha256-hasher = "2.3.0"
+
+[profile.release]
+overflow-checks = true
+lto = "fat"
+codegen-units = 1
