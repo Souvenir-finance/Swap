@@ -7,6 +7,10 @@
 // and waits until new tokens are added, which anyone can do with a plain token transfer to the vault. The program stays upgradeable
 // (the owner, 2026-10-28). The old mint is classic SPL Token and the new one Token-2022 (pump.fun's create_v2); both go through the token
 // interface.
+// A holder may also send old tokens to the swap's deposit address (the owner, 2026-10-31: "if people send the coins to the contract, we
+// send them back the token"): the old-mint account of the PDA ["deposit", config], which no key holds. The seller (the owner of the old
+// destination fixed at `initialize`) then swaps them for that holder with `swap_deposited`, under the same proof, cap, deadline and vault
+// checks as `swap`, or sends them back with `refund_deposit`. Both draw only from the deposit account, so nothing moves that was not sent to it.
 //   leaf = sha256(0x00 || wallet(32) || amount(u64 LE))
 //   node = sha256(0x01 || min(a,b) || max(a,b))      (sorted pairs; a node without a sibling moves up as it is)
 use anchor_lang::prelude::*;
@@ -19,6 +23,8 @@ declare_id!("42Ft9ioktrSK4zLpnqDFgNDdFoYZHQmUhgYothhNCN6J");
 /// The config is ["swap", admin, old_mint, new_mint]: the admin is in the seeds, so nobody else can take a mint pair's config first.
 pub const SWAP_SEED: &[u8] = b"swap";
 pub const RECEIPT_SEED: &[u8] = b"receipt";
+/// The deposit address is ["deposit", config]: a PDA with no data that only signs for its old-mint account.
+pub const DEPOSIT_SEED: &[u8] = b"deposit";
 
 #[program]
 pub mod souvenir_swap {
@@ -62,16 +68,8 @@ pub mod souvenir_swap {
     /// snapshot line, and the vault holds them: otherwise nothing moves (`VaultShort`).
     pub fn swap(ctx: Context<Swap>, amount: u64, entitled: u64, proof: Vec<[u8; 32]>) -> Result<()> {
         let config = &ctx.accounts.config;
-        require!(config.opened, SwapError::NotOpen);
-        require!(Clock::get()?.unix_timestamp < config.deadline, SwapError::PastDeadline);
         let holder = ctx.accounts.holder.key();
-        require!(root_of(leaf(&holder, entitled), &proof) == config.root, SwapError::BadProof);
-        let swapped = ctx.accounts.receipt.swapped.checked_add(amount).ok_or(SwapError::OverEntitled)?;
-        require!(swapped <= entitled, SwapError::OverEntitled);
-        let out = u64::try_from(u128::from(amount) * u128::from(config.new_total) / u128::from(config.old_total))
-            .map_err(|_| SwapError::Overflow)?;
-        require!(out > 0, SwapError::NothingOut);
-        require!(ctx.accounts.new_vault.amount >= out, SwapError::VaultShort);
+        let (swapped, out) = checked_swap(config, ctx.accounts.receipt.swapped, &holder, amount, entitled, &proof, ctx.accounts.new_vault.amount)?;
 
         token_interface::transfer_checked(
             CpiContext::new(ctx.accounts.old_token_program.to_account_info(), TransferChecked {
@@ -122,6 +120,81 @@ pub mod souvenir_swap {
         emit!(Settled { amount: held });
         Ok(())
     }
+
+    /// The seller, for `holder`, who sent old tokens to the deposit address instead of signing a swap: `amount` of them from the deposit
+    /// account to the old destination, and their new tokens from the vault to the holder's account, under every check of `swap` (`holder`'s
+    /// snapshot line and proof, the receipt's cap, the deadline, the vault). The seller pays for the holder's new-token account and receipt.
+    pub fn swap_deposited(ctx: Context<SwapDeposited>, amount: u64, entitled: u64, proof: Vec<[u8; 32]>) -> Result<()> {
+        let config = &ctx.accounts.config;
+        let holder = ctx.accounts.holder.key();
+        let (swapped, out) = checked_swap(config, ctx.accounts.receipt.swapped, &holder, amount, entitled, &proof, ctx.accounts.new_vault.amount)?;
+
+        let config_key = config.key();
+        let deposit_seeds: &[&[u8]] = &[DEPOSIT_SEED, config_key.as_ref(), &[ctx.bumps.deposit_authority]];
+        token_interface::transfer_checked(
+            CpiContext::new_with_signer(ctx.accounts.old_token_program.to_account_info(), TransferChecked {
+                from: ctx.accounts.deposit.to_account_info(),
+                mint: ctx.accounts.old_mint.to_account_info(),
+                to: ctx.accounts.old_destination.to_account_info(),
+                authority: ctx.accounts.deposit_authority.to_account_info(),
+            }, &[deposit_seeds]),
+            amount,
+            ctx.accounts.old_mint.decimals,
+        )?;
+        let seeds: &[&[u8]] = &[SWAP_SEED, config.admin.as_ref(), config.old_mint.as_ref(), config.new_mint.as_ref(), &[config.bump]];
+        token_interface::transfer_checked(
+            CpiContext::new_with_signer(ctx.accounts.new_token_program.to_account_info(), TransferChecked {
+                from: ctx.accounts.new_vault.to_account_info(),
+                mint: ctx.accounts.new_mint.to_account_info(),
+                to: ctx.accounts.holder_new.to_account_info(),
+                authority: ctx.accounts.config.to_account_info(),
+            }, &[seeds]),
+            out,
+            ctx.accounts.new_mint.decimals,
+        )?;
+
+        ctx.accounts.receipt.swapped = swapped;
+        let config = &mut ctx.accounts.config;
+        config.swapped_old = config.swapped_old.checked_add(amount).ok_or(SwapError::Overflow)?;
+        emit!(DepositSwapped { holder, amount, out });
+        Ok(())
+    }
+
+    /// The seller, at any time: `amount` old tokens from the deposit account back to `to` (the sender's: one not in the snapshot, past
+    /// its cap, after the deadline, or while the vault cannot pay).
+    pub fn refund_deposit(ctx: Context<RefundDeposit>, amount: u64) -> Result<()> {
+        require!(amount > 0, SwapError::NothingOut);
+        let config_key = ctx.accounts.config.key();
+        let deposit_seeds: &[&[u8]] = &[DEPOSIT_SEED, config_key.as_ref(), &[ctx.bumps.deposit_authority]];
+        token_interface::transfer_checked(
+            CpiContext::new_with_signer(ctx.accounts.old_token_program.to_account_info(), TransferChecked {
+                from: ctx.accounts.deposit.to_account_info(),
+                mint: ctx.accounts.old_mint.to_account_info(),
+                to: ctx.accounts.to.to_account_info(),
+                authority: ctx.accounts.deposit_authority.to_account_info(),
+            }, &[deposit_seeds]),
+            amount,
+            ctx.accounts.old_mint.decimals,
+        )?;
+        emit!(DepositRefunded { to: ctx.accounts.to.key(), amount });
+        Ok(())
+    }
+}
+
+/// Every check of a swap, signed or deposited: open, before the deadline, `holder`'s snapshot line under the root, what it has swapped
+/// (`already`) plus `amount` within that line, something to pay, and a vault (`vault`) that holds it. Returns the receipt's new total and
+/// the new tokens paid.
+fn checked_swap(config: &Config, already: u64, holder: &Pubkey, amount: u64, entitled: u64, proof: &[[u8; 32]], vault: u64) -> Result<(u64, u64)> {
+    require!(config.opened, SwapError::NotOpen);
+    require!(Clock::get()?.unix_timestamp < config.deadline, SwapError::PastDeadline);
+    require!(root_of(leaf(holder, entitled), proof) == config.root, SwapError::BadProof);
+    let swapped = already.checked_add(amount).ok_or(SwapError::OverEntitled)?;
+    require!(swapped <= entitled, SwapError::OverEntitled);
+    let out = u64::try_from(u128::from(amount) * u128::from(config.new_total) / u128::from(config.old_total))
+        .map_err(|_| SwapError::Overflow)?;
+    require!(out > 0, SwapError::NothingOut);
+    require!(vault >= out, SwapError::VaultShort);
+    Ok((swapped, out))
 }
 
 fn leaf(wallet: &Pubkey, amount: u64) -> [u8; 32] {
@@ -204,6 +277,60 @@ pub struct Settle<'info> {
     pub new_token_program: Interface<'info, TokenInterface>,
 }
 
+#[derive(Accounts)]
+pub struct SwapDeposited<'info> {
+    /// The seller: the owner of the old destination fixed at `initialize`. It pays for the holder's accounts.
+    #[account(mut)]
+    pub operator: Signer<'info>,
+    /// CHECK: the wallet the deposit is credited to: only its snapshot line (proof) is accepted, and only its own accounts are paid.
+    pub holder: UncheckedAccount<'info>,
+    #[account(mut, has_one = old_mint, has_one = new_mint, seeds = [SWAP_SEED, config.admin.as_ref(), config.old_mint.as_ref(), config.new_mint.as_ref()], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
+    #[account(mint::token_program = old_token_program)]
+    pub old_mint: Box<InterfaceAccount<'info, Mint>>,
+    #[account(mint::token_program = new_token_program)]
+    pub new_mint: Box<InterfaceAccount<'info, Mint>>,
+    /// CHECK: the deposit address, a PDA with no data: it only signs for the deposit account.
+    #[account(seeds = [DEPOSIT_SEED, config.key().as_ref()], bump)]
+    pub deposit_authority: UncheckedAccount<'info>,
+    #[account(mut, associated_token::mint = old_mint, associated_token::authority = deposit_authority, associated_token::token_program = old_token_program)]
+    pub deposit: Box<InterfaceAccount<'info, TokenAccount>>,
+    #[account(init_if_needed, payer = operator, associated_token::mint = new_mint, associated_token::authority = holder,
+        associated_token::token_program = new_token_program)]
+    pub holder_new: Box<InterfaceAccount<'info, TokenAccount>>,
+    #[account(mut, address = config.old_destination @ SwapError::WrongDestination, constraint = old_destination.owner == operator.key() @ SwapError::NotOperator)]
+    pub old_destination: Box<InterfaceAccount<'info, TokenAccount>>,
+    #[account(mut, associated_token::mint = new_mint, associated_token::authority = config, associated_token::token_program = new_token_program)]
+    pub new_vault: Box<InterfaceAccount<'info, TokenAccount>>,
+    #[account(init_if_needed, payer = operator, space = 8 + Receipt::SPACE, seeds = [RECEIPT_SEED, config.key().as_ref(), holder.key().as_ref()], bump)]
+    pub receipt: Box<Account<'info, Receipt>>,
+    pub old_token_program: Interface<'info, TokenInterface>,
+    pub new_token_program: Interface<'info, TokenInterface>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct RefundDeposit<'info> {
+    /// The seller: the owner of the old destination fixed at `initialize`.
+    pub operator: Signer<'info>,
+    #[account(has_one = old_mint, seeds = [SWAP_SEED, config.admin.as_ref(), config.old_mint.as_ref(), config.new_mint.as_ref()], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
+    #[account(mint::token_program = old_token_program)]
+    pub old_mint: Box<InterfaceAccount<'info, Mint>>,
+    /// CHECK: the deposit address, a PDA with no data: it only signs for the deposit account.
+    #[account(seeds = [DEPOSIT_SEED, config.key().as_ref()], bump)]
+    pub deposit_authority: UncheckedAccount<'info>,
+    #[account(mut, associated_token::mint = old_mint, associated_token::authority = deposit_authority, associated_token::token_program = old_token_program)]
+    pub deposit: Box<InterfaceAccount<'info, TokenAccount>>,
+    /// The sender's old-token account.
+    #[account(mut, token::mint = old_mint, token::token_program = old_token_program)]
+    pub to: Box<InterfaceAccount<'info, TokenAccount>>,
+    #[account(address = config.old_destination @ SwapError::WrongDestination, constraint = old_destination.owner == operator.key() @ SwapError::NotOperator)]
+    pub old_destination: Box<InterfaceAccount<'info, TokenAccount>>,
+    pub old_token_program: Interface<'info, TokenInterface>,
+}
+
 /// One swap. Read by Souvenir's server (src/holderswap.mjs decodeConfig) and by anyone checking the swap.
 #[account]
 pub struct Config {
@@ -239,6 +366,10 @@ pub struct Opened { pub new_total: u64 }
 pub struct Swapped { pub holder: Pubkey, pub amount: u64, pub out: u64 }
 #[event]
 pub struct Settled { pub amount: u64 }
+#[event]
+pub struct DepositSwapped { pub holder: Pubkey, pub amount: u64, pub out: u64 }
+#[event]
+pub struct DepositRefunded { pub to: Pubkey, pub amount: u64 }
 
 #[error_code]
 pub enum SwapError {
@@ -262,4 +393,6 @@ pub enum SwapError {
     Overflow,
     #[msg("The vault holds fewer new tokens than this swap pays; it waits until the vault is topped up")]
     VaultShort,
+    #[msg("Only the seller, the owner of the old destination, swaps or refunds deposits")]
+    NotOperator,
 }

@@ -14,13 +14,16 @@ import { tree } from './merkle.mjs';
 
 /** The program's id (its keypair is ~/.config/solana/souvenir-swap-program.json on the owner's machine). */
 export const SWAP_PROGRAM_ID = '42Ft9ioktrSK4zLpnqDFgNDdFoYZHQmUhgYothhNCN6J';
-export const SWAP_SEED = 'swap', RECEIPT_SEED = 'receipt';
+export const SWAP_SEED = 'swap', RECEIPT_SEED = 'receipt', DEPOSIT_SEED = 'deposit';
 /** pump.fun coins have 6 decimals. */
 const NEW_DECIMALS = 6;
 
 const sha256 = (...parts) => createHash('sha256').update(Buffer.concat(parts)).digest();
 const disc = s => sha256(Buffer.from(s)).subarray(0, 8);
-const IX = { initialize: disc('global:initialize'), open: disc('global:open'), swap: disc('global:swap'), settle: disc('global:settle') };
+const IX = {
+  initialize: disc('global:initialize'), open: disc('global:open'), swap: disc('global:swap'), settle: disc('global:settle'),
+  swapDeposited: disc('global:swap_deposited'), refundDeposit: disc('global:refund_deposit'),
+};
 const CONFIG_ACCOUNT = disc('account:Config'), RECEIPT_ACCOUNT = disc('account:Receipt');
 /** A Config account: discriminator, admin, old mint, new mint, root, old total, new total, deadline, swapped old, old destination,
  *  unclaimed destination, opened, bump. */
@@ -47,6 +50,13 @@ export const receiptAddress = (programId, config, wallet) =>
   PublicKey.findProgramAddressSync([Buffer.from(RECEIPT_SEED), key(config).toBuffer(), key(wallet).toBuffer()], key(programId))[0];
 /** The new-token vault: the config's associated token account, under the new mint's token program. */
 export const newVaultAddress = (config, newMint, newTokenProgram) => getAssociatedTokenAddressSync(key(newMint), key(config), true, key(newTokenProgram));
+/** The deposit address, where a holder may send old tokens instead of signing a swap: a PDA of the config that no key holds. A wallet
+ *  sending to it lands in `depositAccount`, its associated old-mint account. */
+export const depositAddress = (programId, config) =>
+  PublicKey.findProgramAddressSync([Buffer.from(DEPOSIT_SEED), key(config).toBuffer()], key(programId))[0];
+/** The deposit address's associated old-mint account, which `swapDeposited` and `refundDeposit` draw from. */
+export const depositAccount = (programId, config, oldMint, oldTokenProgram) =>
+  getAssociatedTokenAddressSync(key(oldMint), depositAddress(programId, config), true, key(oldTokenProgram));
 
 /** A snapshot row's leaf. */
 export const leafOf = ({ wallet, amount }) => sha256(Buffer.from([0]), key(wallet).toBuffer(), u64(amount));
@@ -127,6 +137,54 @@ export function swapInstruction({ programId, admin, holder, oldMint, newMint, ol
       { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
     ],
     data: Buffer.concat([IX.swap, u64(amount), u64(entitled), u32(proof.length), ...proof.map(bytes32)]),
+  });
+}
+
+/** `swap_deposited(amount, entitled, proof)` on `admin`'s swap, signed by `operator` (the seller, the owner of `oldDestination`): `amount`
+ *  old tokens `holder` sent to the deposit address go on to `oldDestination`, and their new tokens from the vault to the holder's associated
+ *  account (created if missing, the operator paying), under every check of `swap`. */
+export function swapDepositedInstruction({ programId, admin, operator, holder, oldMint, newMint, oldTokenProgram, newTokenProgram, oldDestination, amount, entitled, proof }) {
+  const config = configAddress(programId, admin, oldMint, newMint);
+  return new TransactionInstruction({
+    programId: key(programId),
+    keys: [
+      { pubkey: key(operator), isSigner: true, isWritable: true },
+      { pubkey: key(holder), isSigner: false, isWritable: false },
+      { pubkey: config, isSigner: false, isWritable: true },
+      { pubkey: key(oldMint), isSigner: false, isWritable: false },
+      { pubkey: key(newMint), isSigner: false, isWritable: false },
+      { pubkey: depositAddress(programId, config), isSigner: false, isWritable: false },
+      { pubkey: depositAccount(programId, config, oldMint, oldTokenProgram), isSigner: false, isWritable: true },
+      { pubkey: getAssociatedTokenAddressSync(key(newMint), key(holder), true, key(newTokenProgram)), isSigner: false, isWritable: true },
+      { pubkey: key(oldDestination), isSigner: false, isWritable: true },
+      { pubkey: newVaultAddress(config, newMint, newTokenProgram), isSigner: false, isWritable: true },
+      { pubkey: receiptAddress(programId, config, holder), isSigner: false, isWritable: true },
+      { pubkey: key(oldTokenProgram), isSigner: false, isWritable: false },
+      { pubkey: key(newTokenProgram), isSigner: false, isWritable: false },
+      { pubkey: ASSOCIATED_TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+    ],
+    data: Buffer.concat([IX.swapDeposited, u64(amount), u64(entitled), u32(proof.length), ...proof.map(bytes32)]),
+  });
+}
+
+/** `refund_deposit(amount)` on `admin`'s swap, signed by `operator` (the seller): `amount` old tokens from the deposit account back to `to`,
+ *  an old-mint token account (the sender's). */
+export function refundDepositInstruction({ programId, admin, operator, oldMint, newMint, oldTokenProgram, oldDestination, to, amount }) {
+  const config = configAddress(programId, admin, oldMint, newMint);
+  return new TransactionInstruction({
+    programId: key(programId),
+    keys: [
+      { pubkey: key(operator), isSigner: true, isWritable: false },
+      { pubkey: config, isSigner: false, isWritable: false },
+      { pubkey: key(oldMint), isSigner: false, isWritable: false },
+      { pubkey: depositAddress(programId, config), isSigner: false, isWritable: false },
+      { pubkey: depositAccount(programId, config, oldMint, oldTokenProgram), isSigner: false, isWritable: true },
+      { pubkey: key(to), isSigner: false, isWritable: true },
+      { pubkey: key(oldDestination), isSigner: false, isWritable: false },
+      { pubkey: key(oldTokenProgram), isSigner: false, isWritable: false },
+    ],
+    data: Buffer.concat([IX.refundDeposit, u64(amount)]),
   });
 }
 

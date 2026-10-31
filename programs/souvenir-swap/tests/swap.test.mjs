@@ -13,7 +13,7 @@ import {
 } from '@solana/spl-token';
 import {
   SWAP_PROGRAM_ID, configAddress, receiptAddress, newVaultAddress, snapshotTree, initializeInstruction, openInstruction, swapInstruction,
-  settleInstruction, openInstructions, decodeConfig, decodeReceipt,
+  settleInstruction, openInstructions, decodeConfig, decodeReceipt, depositAddress, depositAccount, swapDepositedInstruction, refundDepositInstruction,
 } from '../../../src/holderswap.mjs';
 
 const PROGRAM = new PublicKey(SWAP_PROGRAM_ID);
@@ -59,7 +59,7 @@ function world({ newTotal = NEW, held = { A: 150n * M, B: 50n * M, C: 7n * M } }
   at(svm, NOW);
   const admin = Keypair.generate(), seller = Keypair.generate(), stranger = Keypair.generate();
   const holders = { A: Keypair.generate(), B: Keypair.generate(), C: Keypair.generate() };
-  for (const kp of [admin, stranger, ...Object.values(holders)]) svm.airdrop(kp.publicKey, 10_000_000_000n);
+  for (const kp of [admin, seller, stranger, ...Object.values(holders)]) svm.airdrop(kp.publicKey, 10_000_000_000n);
   const rent = space => Number(svm.minimumBalanceForRentExemption(BigInt(space)));
   const oldMint = Keypair.generate(), newMint = Keypair.generate();
   const oldOf = owner => getAssociatedTokenAddressSync(oldMint.publicKey, owner.publicKey ?? owner);
@@ -363,4 +363,122 @@ test('another wallet initializing the same pair gets its own config, and the adm
   assert.equal(tokens(w.svm, w.vault), NEW);
   ok(swap(w, 'A', 10n * M));
   assert.equal(tokens(w.svm, w.newOf(w.holders.A)), out(10n * M));
+});
+
+// ---------------------------------------------------------------- deposits: old tokens sent to the deposit address, swapped or refunded by the seller
+/** The deposit address's old-mint account, which a wallet's plain send lands in. */
+const depositOf = w => depositAccount(PROGRAM, w.config, w.oldMint, TOKEN_PROGRAM_ID);
+/** `from` (a keypair) sends `amount` old tokens to the deposit address, as a wallet's send does: the account created if missing, then a transfer. */
+const deposit = (w, from, amount) => send(w.svm, from, [
+  createAssociatedTokenAccountIdempotentInstruction(from.publicKey, depositOf(w), depositAddress(PROGRAM, w.config), w.oldMint),
+  createTransferCheckedInstruction(w.oldOf(from), w.oldMint, depositOf(w), from.publicKey, amount, 6),
+]);
+/** The seller (`operator`) swaps `amount` deposited old tokens for `name`, with its snapshot line. */
+const swapDeposited = (w, name, amount, { operator = w.seller, holder = w.holders[name].publicKey, ...over } = {}) => send(w.svm, operator, [swapDepositedInstruction({
+  ...mints(w), operator: operator.publicKey, holder, oldTokenProgram: TOKEN_PROGRAM_ID, oldDestination: w.sellerOld, amount,
+  entitled: ENTITLED[name], proof: w.snap.proofOf(w.holders[name].publicKey), ...over,
+})]);
+/** The seller (`operator`) sends `amount` deposited old tokens back to `to`'s old-token account. */
+const refund = (w, to, amount, { operator = w.seller, ...over } = {}) => send(w.svm, operator, [refundDepositInstruction({
+  ...mints(w), operator: operator.publicKey, oldTokenProgram: TOKEN_PROGRAM_ID, oldDestination: w.sellerOld, to: w.oldOf(to), amount, ...over,
+})]);
+
+test('a deposit is swapped for its sender by the seller, up to the snapshot line; the rest goes back', () => {
+  const w = world();
+  opened(w);
+  const sellerSol = w.svm.getBalance(w.seller.publicKey);
+  ok(deposit(w, w.holders.A, 40n * M));
+  assert.equal(tokens(w.svm, depositOf(w)), 40n * M);
+  ok(swapDeposited(w, 'A', 40n * M));
+  assert.equal(tokens(w.svm, w.newOf(w.holders.A)), out(40n * M), 'A got its new tokens without signing anything');
+  assert.equal(tokens(w.svm, w.sellerOld), 40n * M, 'the old tokens went on to the seller');
+  assert.equal(tokens(w.svm, depositOf(w)), 0n);
+  assert.equal(decodeReceipt(w.svm.getAccount(receiptAddress(PROGRAM, w.config, w.holders.A.publicKey)).data).swapped, 40n * M);
+  assert.ok(w.svm.getBalance(w.seller.publicKey) < sellerSol, 'the seller paid for A\'s new-token account and receipt');
+
+  // A sends 70 more, past its 100: 60 swap, 10 go back.
+  ok(deposit(w, w.holders.A, 70n * M));
+  failed(swapDeposited(w, 'A', 70n * M), /OverEntitled/);
+  ok(swapDeposited(w, 'A', 60n * M));
+  ok(refund(w, w.holders.A, 10n * M));
+  assert.equal(tokens(w.svm, w.newOf(w.holders.A)), out(100n * M));
+  assert.equal(tokens(w.svm, w.oldOf(w.holders.A)), 150n * M - 110n * M + 10n * M, 'the 10 past its line came back');
+  assert.equal(tokens(w.svm, depositOf(w)), 0n);
+  assert.equal(configOf(w).swappedOld, 100n * M);
+  assert.equal(tokens(w.svm, w.vault), NEW - out(100n * M));
+});
+
+test('deposit swaps and signed swaps share one cap', () => {
+  const w = world();
+  opened(w);
+  ok(swap(w, 'A', 70n * M));
+  ok(deposit(w, w.holders.A, 40n * M));
+  failed(swapDeposited(w, 'A', 40n * M), /OverEntitled/);
+  ok(swapDeposited(w, 'A', 30n * M));
+  failed(swap(w, 'A', 1n), /OverEntitled/, 'nor can A sign a swap past it');
+  ok(refund(w, w.holders.A, 10n * M));
+  assert.equal(tokens(w.svm, w.newOf(w.holders.A)), out(100n * M));
+});
+
+test('only the seller swaps or refunds deposits, and only from the deposit account', () => {
+  const w = world();
+  opened(w);
+  ok(deposit(w, w.holders.A, 20n * M));
+  failed(swapDeposited(w, 'A', 20n * M, { operator: w.stranger }), /NotOperator/);
+  failed(swapDeposited(w, 'A', 20n * M, { operator: w.admin }), /NotOperator/);
+  failed(swapDeposited(w, 'A', 20n * M, { operator: w.holders.A }), /NotOperator/, 'not even the sender');
+  failed(refund(w, w.holders.A, 20n * M, { operator: w.stranger }), /NotOperator/);
+  failed(refund(w, w.holders.A, 20n * M, { operator: w.admin }), /NotOperator/);
+  // The seller naming another old destination (its own other account, or the stranger's) is refused.
+  failed(swapDeposited(w, 'A', 20n * M, { oldDestination: w.oldOf(w.holders.A) }), /WrongDestination|NotOperator/);
+  ok(send(w.svm, w.stranger, [createAssociatedTokenAccountIdempotentInstruction(w.stranger.publicKey, w.oldOf(w.stranger), w.stranger.publicKey, w.oldMint)]));
+  failed(refund(w, w.stranger, 20n * M, { oldDestination: w.oldOf(w.stranger) }), /WrongDestination|NotOperator/);
+  // The seller cannot pay more than was deposited, whoever it credits: the transfer from the deposit account fails.
+  failed(swapDeposited(w, 'A', 21n * M), /insufficient funds/i);
+  failed(swapDeposited(w, 'B', 50n * M), /insufficient funds/i);
+  failed(refund(w, w.holders.A, 21n * M), /insufficient funds/i);
+  assert.equal(tokens(w.svm, depositOf(w)), 20n * M);
+  assert.equal(tokens(w.svm, w.vault), NEW, 'nothing left the vault');
+  assert.equal(w.svm.getAccount(receiptAddress(PROGRAM, w.config, w.holders.B.publicKey)), null);
+  ok(swapDeposited(w, 'A', 20n * M));
+});
+
+test('a deposit swap keeps every check of a swap: the proof, open, the deadline, the vault', () => {
+  const w = world({ newTotal: OLD_TOTAL });
+  ok(initialize(w));
+  ok(fund(w, 30n * M));
+  ok(deposit(w, w.holders.A, 50n * M));
+  failed(swapDeposited(w, 'A', 10n * M), /NotOpen/);
+  ok(open(w));
+  failed(swapDeposited(w, 'A', 10n * M, { entitled: 101n * M }), /BadProof/);
+  failed(swapDeposited(w, 'A', 10n * M, { proof: w.snap.proofOf(w.holders.B.publicKey) }), /BadProof/);
+  failed(swapDeposited(w, 'A', 10n * M, { holder: w.stranger.publicKey }), /BadProof/, 'A\'s line credited to a wallet not in the snapshot');
+  failed(swapDeposited(w, 'A', 0n), /NothingOut/);
+  failed(swapDeposited(w, 'A', 40n * M), /VaultShort/);
+  assert.equal(tokens(w.svm, depositOf(w)), 50n * M, 'a short vault takes nothing: the deposit waits');
+  ok(swapDeposited(w, 'A', 30n * M));
+  ok(fund(w, 20n * M));
+  ok(swapDeposited(w, 'A', 20n * M));
+  ok(deposit(w, w.holders.A, 5n * M));
+  at(w.svm, DEADLINE);
+  failed(swapDeposited(w, 'A', 5n * M), /PastDeadline/);
+  ok(refund(w, w.holders.A, 5n * M), 'after the deadline a deposit is refunded');
+  assert.equal(tokens(w.svm, depositOf(w)), 0n);
+});
+
+test('a wallet outside the snapshot gets its deposit back, and nothing else', () => {
+  const w = world();
+  opened(w);
+  ok(send(w.svm, w.holders.A, [
+    createAssociatedTokenAccountIdempotentInstruction(w.holders.A.publicKey, w.oldOf(w.stranger), w.stranger.publicKey, w.oldMint),
+    createTransferCheckedInstruction(w.oldOf(w.holders.A), w.oldMint, w.oldOf(w.stranger), w.holders.A.publicKey, 10n * M, 6),
+  ]));
+  ok(deposit(w, w.stranger, 10n * M));
+  failed(swapDeposited(w, 'A', 10n * M, { holder: w.stranger.publicKey }), /BadProof/);
+  ok(refund(w, w.stranger, 10n * M));
+  assert.equal(tokens(w.svm, w.oldOf(w.stranger)), 10n * M);
+  assert.equal(tokens(w.svm, w.newOf(w.stranger)), null);
+  assert.equal(tokens(w.svm, w.vault), NEW);
+  assert.ok(depositAddress(PROGRAM, w.config).toBase58() !== w.config.toBase58() && !PublicKey.isOnCurve(depositAddress(PROGRAM, w.config).toBytes()),
+    'the deposit address is a PDA: no key can spend from it');
 });

@@ -20,13 +20,22 @@ for it, and the program checks every one.
 - Adding to the vault takes no instruction: anyone can send new tokens to it with a plain token transfer. The vault opens with the team's dev buy, which
   covers most of the snapshot, and the team tops it up if it runs low; its balance is public (the vault is the config's associated account of the new mint).
 - `settle()`: anyone, from the deadline on (2027-02-15 00:00 UTC, unix 1802649600). Every new token left in the vault goes to `unclaimed_destination`.
+- Sending instead of signing: a holder may send old tokens with a plain transfer to the swap's deposit address, the PDA `["deposit", config]`, which no key
+  holds (its old-mint associated account takes them). Then the seller, the owner of `old_destination`, calls `swap_deposited(amount, entitled, proof)` for
+  that holder: the same checks as `swap` (the holder's snapshot line and proof, its receipt's cap, the deadline, the vault), with the old tokens taken from
+  the deposit account instead of the holder's, and the new ones paid to the holder's own account. What it cannot swap (past the holder's line, from a wallet
+  outside the snapshot, after the deadline) it sends back with `refund_deposit(amount)`. Both only draw from the deposit account, and only the seller signs them.
 
 The root, the rate, the deadline and both destinations are fixed by `initialize` and `open`; no instruction changes them.
 
 ## What it does not do
 
-- No instruction moves new tokens except `swap` (to the swapper) and `settle` (to `unclaimed_destination`). The admin has no withdraw, no pause and no way to
-  change anything after `open`.
+- No instruction moves new tokens except `swap` and `swap_deposited` (to the holder, within its snapshot line) and `settle` (to `unclaimed_destination`).
+  The admin has no withdraw, no pause and no way to change anything after `open`.
+- A transfer does not tell the program who sent it, so for a deposit the seller says whom to credit. It can only credit a wallet in the snapshot, within
+  that wallet's line and to that wallet's own account, and never more than the deposit account holds. Deposited old tokens it does not swap, the seller
+  sends wherever it names (`refund_deposit` takes any old-token account): Souvenir's keeper sends them back to the account they came from, but that is the
+  seller's word, not the program's. While tokens wait in the deposit account they depend on the seller key. Signing a swap yourself leaves the seller out of it.
 - The program never holds old tokens and has no say in what happens to them afterwards. The seller sells them into the old pool and the team's costs
   are repaid from the proceeds (announced separately, with a public ledger on /migrate).
 - It does not check that the snapshot is honest. The root is the admin's input; the snapshot is checkable against the chain (below).
@@ -161,8 +170,9 @@ npm test
 
 The tests run the program on [LiteSVM](https://github.com/LiteSVM/litesvm), an in-memory Solana runtime whose clock can be moved. They build every
 instruction with `src/holderswap.mjs`, the same builders the site and the owner's script use, and cover proofs, the per-wallet cap across partial
-swaps, rounding, the deadline, old tokens landing in `old_destination`, `settle` called by a stranger, the admin being unable to touch new tokens, and a
-Token-2022 new mint (pump.fun's).
+swaps, rounding, the deadline, old tokens landing in `old_destination`, `settle` called by a stranger, the admin being unable to touch new tokens, a
+Token-2022 new mint (pump.fun's), and deposits: swapped or sent back by the seller alone, under the same proof, cap, deadline and vault checks as a swap, one
+cap shared with signed swaps, and never more than the deposit account holds.
 
 ## Layout
 
