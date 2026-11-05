@@ -53,6 +53,9 @@ export const INCINERATOR = '1nc1nerator11111111111111111111111111111111';
 const DECIMALS = 6, UNIT = 10n ** 6n;
 /** How long `open --phantom --yes` (and `topup`'s) waits for the page to send back a signed transaction before it stops. */
 export const SIGNING_TIMEOUT_MS = 10 * 60_000;
+/** A signature the RPC has confirmed but whose transaction it cannot return yet (the lookup can trail the status: on 2026-11-05 the real `open`
+ *  landed and was refused as "not on chain") is looked up again, this many more times, this far apart. */
+export const LOOKUP_TRIES = 15, LOOKUP_GAP_MS = 2000;
 
 export class UsageError extends Error {}
 
@@ -356,7 +359,7 @@ const TOPUP = {
  * in Phantom mode the confirmation also carries the `signature` and `landed`, the transaction as the chain has it (Phantom sent it, so what it
  * does is read there).
  */
-async function signAndSend({ options, log, connection, keypair, admin, instructions, labels, words, at, rows, serve, timeoutMs }) {
+async function signAndSend({ options, log, connection, keypair, admin, instructions, labels, words, at, rows, serve, timeoutMs, lookupGapMs = LOOKUP_GAP_MS }) {
   const phantom = !keypair, send = Boolean(options.yes);
   const transaction = new Transaction().add(...instructions);
   const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
@@ -419,7 +422,12 @@ async function signAndSend({ options, log, connection, keypair, admin, instructi
         let confirmed = null, waited = null;
         try { confirmed = await connection.confirmTransaction({ signature, blockhash: latest.blockhash, lastValidBlockHeight: latest.lastValidBlockHeight }, 'confirmed'); }
         catch (error) { waited = error; }
-        const landed = await connection.getTransaction(signature, { commitment: 'confirmed', maxSupportedTransactionVersion: 0 });
+        const lookup = () => connection.getTransaction(signature, { commitment: 'confirmed', maxSupportedTransactionVersion: 0 });
+        let landed = await lookup();
+        for (let tries = 0; !landed && confirmed && tries < LOOKUP_TRIES; tries++) {
+          await new Promise(resolve => setTimeout(resolve, lookupGapMs));
+          landed = await lookup();
+        }
         if (!landed) throw new Error(`${signature} is not on chain${waited ? `: ${waited.message}` : '.'}`);
         const { message } = landed.transaction;
         if (!message.staticAccountKeys.slice(0, message.header.numRequiredSignatures).some(signer => signer.equals(admin))) {
@@ -448,7 +456,7 @@ function devWallet(options) {
  * reported and nothing is sent. The dev wallet signs from `--keypair`, or with `--phantom` in Phantom, on the page `serve` serves (the
  * already-open check, the balance and the opening come first; nothing is served without `--yes`). `connection` and `serve`/`timeoutMs` are for tests.
  */
-export async function runOpen(options, log, connection = new Connection(options.rpc, 'confirmed'), { serve = serveSigning, timeoutMs = SIGNING_TIMEOUT_MS } = {}) {
+export async function runOpen(options, log, connection = new Connection(options.rpc, 'confirmed'), { serve = serveSigning, timeoutMs = SIGNING_TIMEOUT_MS, lookupGapMs = LOOKUP_GAP_MS } = {}) {
   const { keypair, admin, signer } = devWallet(options), phantom = !keypair;
   const oldMint = options['old-mint'] ? parseWallet(options['old-mint'], '--old-mint') : OLD_MINT;
   const newMint = parseWallet(options['new-mint'], '--new-mint'), seller = parseWallet(options.seller, '--seller');
@@ -492,7 +500,7 @@ export async function runOpen(options, log, connection = new Connection(options.
   log(`Deadline         ${deadline}`);
 
   const confirmation = await signAndSend({
-    options, log, connection, keypair, admin, instructions, labels, words: OPENING, at: config.toBase58(), serve, timeoutMs,
+    options, log, connection, keypair, admin, instructions, labels, words: OPENING, at: config.toBase58(), serve, timeoutMs, lookupGapMs,
     rows: [
       ['Config', config.toBase58()], ['Dev wallet', `${admin.toBase58()} (the swap's admin)`], ['New mint', newMint], ['Old mint', oldMint],
       ['Snapshot total', `${tokens(snapshot.total)} tokens`], ['Into the vault', `${tokens(balance)} new tokens, all the dev wallet holds`],
@@ -541,7 +549,7 @@ export function movesTopup(landed, { source, vault, amount, program }) {
  * and after, and once sent, its new balance and how much of the snapshot it covers. Signed in Phantom, it fails unless the transaction that landed
  * moves exactly the amount from the dev wallet's new-token account into the vault (movesTopup). `connection` and `serve`/`timeoutMs` are for tests.
  */
-export async function runTopup(options, log, connection = new Connection(options.rpc, 'confirmed'), { serve = serveSigning, timeoutMs = SIGNING_TIMEOUT_MS } = {}) {
+export async function runTopup(options, log, connection = new Connection(options.rpc, 'confirmed'), { serve = serveSigning, timeoutMs = SIGNING_TIMEOUT_MS, lookupGapMs = LOOKUP_GAP_MS } = {}) {
   const { keypair, admin } = devWallet(options), phantom = !keypair;
   const oldMint = options['old-mint'] ? parseWallet(options['old-mint'], '--old-mint') : OLD_MINT;
   const newMint = parseWallet(options['new-mint'], '--new-mint'), amount = parseAmount(options.amount);
@@ -578,7 +586,7 @@ export async function runTopup(options, log, connection = new Connection(options
 
   const confirmation = await signAndSend({
     options, log, connection, keypair, admin, instructions, labels: [`Move ${tokens(amount)} new tokens from the dev wallet into the vault`],
-    words: TOPUP, at: vaultAddress.toBase58(), serve, timeoutMs,
+    words: TOPUP, at: vaultAddress.toBase58(), serve, timeoutMs, lookupGapMs,
     rows: [
       ['Config', config.toBase58()], ['Vault', vaultAddress.toBase58()], ['Dev wallet', `${admin.toBase58()} (the swap's admin)`], ['New mint', newMint],
       ['Top-up', `${tokens(amount)} new tokens`], ['Vault now', now], ['Vault after', after], ['Checked on', host],
