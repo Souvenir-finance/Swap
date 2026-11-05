@@ -11,6 +11,11 @@
 // send them back the token"): the old-mint account of the PDA ["deposit", config], which no key holds. The seller (the owner of the old
 // destination fixed at `initialize`) then swaps them for that holder with `swap_deposited`, under the same proof, cap, deadline and vault
 // checks as `swap`, or sends them back with `refund_deposit`. Both draw only from the deposit account, so nothing moves that was not sent to it.
+// A wallet that sold or moved old tokens after the snapshot may swap only the lowest it held since (the owner, 2026-11-05: "if ppl sell they
+// cant swap ... it would be unfair if they sell and then buyback cheap and swap"). The chain keeps no past balances, so Souvenir's server
+// watches them and the seller writes each such wallet's Limit (`set_limit`, ["limit", config, wallet]): every swap passes the holder's
+// Limit address last and stops at it once there is one. `set_limit` moves no tokens and never lifts a swap past the snapshot line, which
+// every swap still checks; the seller sets it again, higher, when the owner finds a wallet only moved its coins between its own wallets.
 //   leaf = sha256(0x00 || wallet(32) || amount(u64 LE))
 //   node = sha256(0x01 || min(a,b) || max(a,b))      (sorted pairs; a node without a sibling moves up as it is)
 use anchor_lang::prelude::*;
@@ -25,6 +30,8 @@ pub const SWAP_SEED: &[u8] = b"swap";
 pub const RECEIPT_SEED: &[u8] = b"receipt";
 /// The deposit address is ["deposit", config]: a PDA with no data that only signs for its old-mint account.
 pub const DEPOSIT_SEED: &[u8] = b"deposit";
+/// A wallet's Limit is ["limit", config, wallet]: no account there, no limit.
+pub const LIMIT_SEED: &[u8] = b"limit";
 
 #[program]
 pub mod souvenir_swap {
@@ -69,7 +76,8 @@ pub mod souvenir_swap {
     pub fn swap(ctx: Context<Swap>, amount: u64, entitled: u64, proof: Vec<[u8; 32]>) -> Result<()> {
         let config = &ctx.accounts.config;
         let holder = ctx.accounts.holder.key();
-        let (swapped, out) = checked_swap(config, ctx.accounts.receipt.swapped, &holder, amount, entitled, &proof, ctx.accounts.new_vault.amount)?;
+        let limit = limit_of(&ctx.accounts.limit)?;
+        let (swapped, out) = checked_swap(config, ctx.accounts.receipt.swapped, limit, &holder, amount, entitled, &proof, ctx.accounts.new_vault.amount)?;
 
         token_interface::transfer_checked(
             CpiContext::new(ctx.accounts.old_token_program.to_account_info(), TransferChecked {
@@ -127,7 +135,8 @@ pub mod souvenir_swap {
     pub fn swap_deposited(ctx: Context<SwapDeposited>, amount: u64, entitled: u64, proof: Vec<[u8; 32]>) -> Result<()> {
         let config = &ctx.accounts.config;
         let holder = ctx.accounts.holder.key();
-        let (swapped, out) = checked_swap(config, ctx.accounts.receipt.swapped, &holder, amount, entitled, &proof, ctx.accounts.new_vault.amount)?;
+        let limit = limit_of(&ctx.accounts.limit)?;
+        let (swapped, out) = checked_swap(config, ctx.accounts.receipt.swapped, limit, &holder, amount, entitled, &proof, ctx.accounts.new_vault.amount)?;
 
         let config_key = config.key();
         let deposit_seeds: &[&[u8]] = &[DEPOSIT_SEED, config_key.as_ref(), &[ctx.bumps.deposit_authority]];
@@ -179,17 +188,40 @@ pub mod souvenir_swap {
         emit!(DepositRefunded { to: ctx.accounts.to.key(), amount });
         Ok(())
     }
+
+    /// The seller, for `holder`: from now on `holder` may have swapped at most `kept` old tokens in all (signed and deposited swaps alike),
+    /// its snapshot line still capping it too. Set again, it is replaced. Souvenir's server sets it to the lowest the wallet held since the
+    /// snapshot. It moves no tokens; the seller pays for the account.
+    pub fn set_limit(ctx: Context<SetLimit>, kept: u64) -> Result<()> {
+        ctx.accounts.limit.kept = kept;
+        emit!(Limited { holder: ctx.accounts.holder.key(), kept });
+        Ok(())
+    }
+}
+
+/// A holder's Limit from the account at its address (the accounts' seeds check the address): none while nothing is there.
+fn limit_of(info: &AccountInfo) -> Result<Option<u64>> {
+    if info.data_is_empty() {
+        return Ok(None);
+    }
+    require_keys_eq!(*info.owner, crate::ID, SwapError::BadLimit);
+    let data = info.try_borrow_data()?;
+    Ok(Some(Limit::try_deserialize(&mut &data[..])?.kept))
 }
 
 /// Every check of a swap, signed or deposited: open, before the deadline, `holder`'s snapshot line under the root, what it has swapped
-/// (`already`) plus `amount` within that line, something to pay, and a vault (`vault`) that holds it. Returns the receipt's new total and
-/// the new tokens paid.
-fn checked_swap(config: &Config, already: u64, holder: &Pubkey, amount: u64, entitled: u64, proof: &[[u8; 32]], vault: u64) -> Result<(u64, u64)> {
+/// (`already`) plus `amount` within that line and within its Limit (`limit`, when the seller set one), something to pay, and a vault
+/// (`vault`) that holds it. Returns the receipt's new total and the new tokens paid.
+#[allow(clippy::too_many_arguments)]
+fn checked_swap(config: &Config, already: u64, limit: Option<u64>, holder: &Pubkey, amount: u64, entitled: u64, proof: &[[u8; 32]], vault: u64) -> Result<(u64, u64)> {
     require!(config.opened, SwapError::NotOpen);
     require!(Clock::get()?.unix_timestamp < config.deadline, SwapError::PastDeadline);
     require!(root_of(leaf(holder, entitled), proof) == config.root, SwapError::BadProof);
     let swapped = already.checked_add(amount).ok_or(SwapError::OverEntitled)?;
     require!(swapped <= entitled, SwapError::OverEntitled);
+    if let Some(kept) = limit {
+        require!(swapped <= kept, SwapError::OverLimit);
+    }
     let out = u64::try_from(u128::from(amount) * u128::from(config.new_total) / u128::from(config.old_total))
         .map_err(|_| SwapError::Overflow)?;
     require!(out > 0, SwapError::NothingOut);
@@ -262,6 +294,9 @@ pub struct Swap<'info> {
     pub new_token_program: Interface<'info, TokenInterface>,
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
+    /// CHECK: the holder's Limit (["limit", config, holder]), last: read by the handler, no limit while there is no account there.
+    #[account(seeds = [LIMIT_SEED, config.key().as_ref(), holder.key().as_ref()], bump)]
+    pub limit: UncheckedAccount<'info>,
 }
 
 #[derive(Accounts)]
@@ -308,6 +343,9 @@ pub struct SwapDeposited<'info> {
     pub new_token_program: Interface<'info, TokenInterface>,
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
+    /// CHECK: the holder's Limit (["limit", config, holder]), last: read by the handler, no limit while there is no account there.
+    #[account(seeds = [LIMIT_SEED, config.key().as_ref(), holder.key().as_ref()], bump)]
+    pub limit: UncheckedAccount<'info>,
 }
 
 #[derive(Accounts)]
@@ -329,6 +367,22 @@ pub struct RefundDeposit<'info> {
     #[account(address = config.old_destination @ SwapError::WrongDestination, constraint = old_destination.owner == operator.key() @ SwapError::NotOperator)]
     pub old_destination: Box<InterfaceAccount<'info, TokenAccount>>,
     pub old_token_program: Interface<'info, TokenInterface>,
+}
+
+#[derive(Accounts)]
+pub struct SetLimit<'info> {
+    /// The seller: the owner of the old destination fixed at `initialize`. It pays for the Limit.
+    #[account(mut)]
+    pub operator: Signer<'info>,
+    /// CHECK: the wallet limited: any address (only a snapshot wallet's Limit is ever read by a swap that can pass).
+    pub holder: UncheckedAccount<'info>,
+    #[account(seeds = [SWAP_SEED, config.admin.as_ref(), config.old_mint.as_ref(), config.new_mint.as_ref()], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
+    #[account(address = config.old_destination @ SwapError::WrongDestination, constraint = old_destination.owner == operator.key() @ SwapError::NotOperator)]
+    pub old_destination: Box<InterfaceAccount<'info, TokenAccount>>,
+    #[account(init_if_needed, payer = operator, space = 8 + Limit::SPACE, seeds = [LIMIT_SEED, config.key().as_ref(), holder.key().as_ref()], bump)]
+    pub limit: Box<Account<'info, Limit>>,
+    pub system_program: Program<'info, System>,
 }
 
 /// One swap. Read by Souvenir's server (src/holderswap.mjs decodeConfig) and by anyone checking the swap.
@@ -360,6 +414,15 @@ impl Receipt {
     pub const SPACE: usize = 8;
 }
 
+/// The most one wallet may have swapped in all, in old tokens, set by the seller (`set_limit`).
+#[account]
+pub struct Limit {
+    pub kept: u64,
+}
+impl Limit {
+    pub const SPACE: usize = 8;
+}
+
 #[event]
 pub struct Opened { pub new_total: u64 }
 #[event]
@@ -370,6 +433,8 @@ pub struct Settled { pub amount: u64 }
 pub struct DepositSwapped { pub holder: Pubkey, pub amount: u64, pub out: u64 }
 #[event]
 pub struct DepositRefunded { pub to: Pubkey, pub amount: u64 }
+#[event]
+pub struct Limited { pub holder: Pubkey, pub kept: u64 }
 
 #[error_code]
 pub enum SwapError {
@@ -395,4 +460,8 @@ pub enum SwapError {
     VaultShort,
     #[msg("Only the seller, the owner of the old destination, swaps or refunds deposits")]
     NotOperator,
+    #[msg("This wallet sold or moved old tokens after the snapshot: it may swap only the lowest it held since")]
+    OverLimit,
+    #[msg("Not this program's Limit account")]
+    BadLimit,
 }

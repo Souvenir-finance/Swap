@@ -14,7 +14,7 @@ import { tree } from './merkle.mjs';
 
 /** The program's id (its keypair is ~/.config/solana/souvenir-swap-program.json on the owner's machine). */
 export const SWAP_PROGRAM_ID = '42Ft9ioktrSK4zLpnqDFgNDdFoYZHQmUhgYothhNCN6J';
-export const SWAP_SEED = 'swap', RECEIPT_SEED = 'receipt', DEPOSIT_SEED = 'deposit';
+export const SWAP_SEED = 'swap', RECEIPT_SEED = 'receipt', DEPOSIT_SEED = 'deposit', LIMIT_SEED = 'limit';
 /** pump.fun coins have 6 decimals. */
 const NEW_DECIMALS = 6;
 
@@ -22,14 +22,18 @@ const sha256 = (...parts) => createHash('sha256').update(Buffer.concat(parts)).d
 const disc = s => sha256(Buffer.from(s)).subarray(0, 8);
 const IX = {
   initialize: disc('global:initialize'), open: disc('global:open'), swap: disc('global:swap'), settle: disc('global:settle'),
-  swapDeposited: disc('global:swap_deposited'), refundDeposit: disc('global:refund_deposit'),
+  swapDeposited: disc('global:swap_deposited'), refundDeposit: disc('global:refund_deposit'), setLimit: disc('global:set_limit'),
 };
-const CONFIG_ACCOUNT = disc('account:Config'), RECEIPT_ACCOUNT = disc('account:Receipt');
+const CONFIG_ACCOUNT = disc('account:Config');
+/** The first 8 bytes of every Receipt and of every Limit (both 16 bytes long: these tell them apart in a getProgramAccounts). */
+export const RECEIPT_ACCOUNT = disc('account:Receipt'), LIMIT_ACCOUNT = disc('account:Limit');
 /** A Config account: discriminator, admin, old mint, new mint, root, old total, new total, deadline, swapped old, old destination,
  *  unclaimed destination, opened, bump. */
 const CONFIG_SIZE = 8 + 32 + 32 + 32 + 32 + 8 + 8 + 8 + 8 + 32 + 32 + 1 + 1;
 /** A Receipt account: discriminator, swapped. */
-const RECEIPT_SIZE = 8 + 8;
+export const RECEIPT_SIZE = 8 + 8;
+/** A Limit account: discriminator, kept. As large as a Receipt: told apart by the discriminator. */
+export const LIMIT_SIZE = 8 + 8;
 
 const u64 = n => { const b = Buffer.alloc(8); b.writeBigUInt64LE(BigInt(n)); return b; };
 const i64 = n => { const b = Buffer.alloc(8); b.writeBigInt64LE(BigInt(n)); return b; };
@@ -48,6 +52,10 @@ export const configAddress = (programId, admin, oldMint, newMint) =>
 /** A wallet's Receipt: what it has swapped so far. */
 export const receiptAddress = (programId, config, wallet) =>
   PublicKey.findProgramAddressSync([Buffer.from(RECEIPT_SEED), key(config).toBuffer(), key(wallet).toBuffer()], key(programId))[0];
+/** A wallet's Limit: the most it may have swapped in all, set by the seller (`set_limit`) once it sold or moved old tokens after the
+ *  snapshot (src/migrationkept.mjs). No account there is no limit. Every swap passes it, last, so the program can check it. */
+export const limitAddress = (programId, config, wallet) =>
+  PublicKey.findProgramAddressSync([Buffer.from(LIMIT_SEED), key(config).toBuffer(), key(wallet).toBuffer()], key(programId))[0];
 /** The new-token vault: the config's associated token account, under the new mint's token program. */
 export const newVaultAddress = (config, newMint, newTokenProgram) => getAssociatedTokenAddressSync(key(newMint), key(config), true, key(newTokenProgram));
 /** The deposit address, where a holder may send old tokens instead of signing a swap: a PDA of the config that no key holds. A wallet
@@ -135,6 +143,8 @@ export function swapInstruction({ programId, admin, holder, oldMint, newMint, ol
       { pubkey: key(newTokenProgram), isSigner: false, isWritable: false },
       { pubkey: ASSOCIATED_TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
       { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+      // The holder's Limit, last: a program without limits takes it as one of the remaining accounts and ignores it.
+      { pubkey: limitAddress(programId, config, holder), isSigner: false, isWritable: false },
     ],
     data: Buffer.concat([IX.swap, u64(amount), u64(entitled), u32(proof.length), ...proof.map(bytes32)]),
   });
@@ -163,6 +173,8 @@ export function swapDepositedInstruction({ programId, admin, operator, holder, o
       { pubkey: key(newTokenProgram), isSigner: false, isWritable: false },
       { pubkey: ASSOCIATED_TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
       { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+      // The holder's Limit, last: a program without limits takes it as one of the remaining accounts and ignores it.
+      { pubkey: limitAddress(programId, config, holder), isSigner: false, isWritable: false },
     ],
     data: Buffer.concat([IX.swapDeposited, u64(amount), u64(entitled), u32(proof.length), ...proof.map(bytes32)]),
   });
@@ -185,6 +197,25 @@ export function refundDepositInstruction({ programId, admin, operator, oldMint, 
       { pubkey: key(oldTokenProgram), isSigner: false, isWritable: false },
     ],
     data: Buffer.concat([IX.refundDeposit, u64(amount)]),
+  });
+}
+
+/** `set_limit(kept)` on `admin`'s swap, signed by `operator` (the seller, the owner of `oldDestination`, who pays for the account): from now on
+ *  `holder` may have swapped at most `kept` old tokens in all, whatever its snapshot line (src/migrationkept.mjs). Set again, it is replaced:
+ *  the owner's excuse raises it, never past the line, which every swap still checks. */
+export function setLimitInstruction({ programId, admin, operator, holder, oldMint, newMint, oldDestination, kept }) {
+  const config = configAddress(programId, admin, oldMint, newMint);
+  return new TransactionInstruction({
+    programId: key(programId),
+    keys: [
+      { pubkey: key(operator), isSigner: true, isWritable: true },
+      { pubkey: key(holder), isSigner: false, isWritable: false },
+      { pubkey: config, isSigner: false, isWritable: false },
+      { pubkey: key(oldDestination), isSigner: false, isWritable: false },
+      { pubkey: limitAddress(programId, config, holder), isSigner: false, isWritable: true },
+      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+    ],
+    data: Buffer.concat([IX.setLimit, u64(kept)]),
   });
 }
 
@@ -243,4 +274,11 @@ export function decodeReceipt(data) {
   const b = Buffer.from(data);
   if (b.length !== RECEIPT_SIZE || !b.subarray(0, 8).equals(RECEIPT_ACCOUNT)) return null;
   return { swapped: b.readBigUInt64LE(8) };
+}
+
+/** A Limit account's data, or null when it is not one: `{ kept: BigInt }`. */
+export function decodeLimit(data) {
+  const b = Buffer.from(data);
+  if (b.length !== LIMIT_SIZE || !b.subarray(0, 8).equals(LIMIT_ACCOUNT)) return null;
+  return { kept: b.readBigUInt64LE(8) };
 }

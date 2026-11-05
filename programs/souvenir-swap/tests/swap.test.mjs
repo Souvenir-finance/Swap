@@ -14,6 +14,7 @@ import {
 import {
   SWAP_PROGRAM_ID, configAddress, receiptAddress, newVaultAddress, snapshotTree, initializeInstruction, openInstruction, swapInstruction,
   settleInstruction, openInstructions, decodeConfig, decodeReceipt, depositAddress, depositAccount, swapDepositedInstruction, refundDepositInstruction,
+  setLimitInstruction, limitAddress, decodeLimit,
 } from '../../../src/holderswap.mjs';
 
 const PROGRAM = new PublicKey(SWAP_PROGRAM_ID);
@@ -482,3 +483,70 @@ test('a wallet outside the snapshot gets its deposit back, and nothing else', ()
   assert.ok(depositAddress(PROGRAM, w.config).toBase58() !== w.config.toBase58() && !PublicKey.isOnCurve(depositAddress(PROGRAM, w.config).toBytes()),
     'the deposit address is a PDA: no key can spend from it');
 });
+
+// ---- limits: a wallet that sold or moved old tokens after the snapshot swaps only the lowest it held since (the owner, 2026-11-05) ----
+/** The seller (`operator`) sets `name`'s Limit to `kept`. */
+const setLimit = (w, name, kept, { operator = w.seller, holder = w.holders[name].publicKey, ...over } = {}) => send(w.svm, operator, [setLimitInstruction({
+  ...mints(w), operator: operator.publicKey, holder, oldDestination: w.sellerOld, kept, ...over,
+})]);
+const limitOf = (w, name) => { const a = w.svm.getAccount(limitAddress(PROGRAM, w.config, w.holders[name].publicKey)); return a ? decodeLimit(a.data).kept : null; };
+
+test('a Limit stops signed and deposited swaps at what the wallet kept; set higher it lifts them, never past the snapshot line', () => {
+  const w = world();
+  opened(w);
+  ok(swap(w, 'A', 10n * M));
+  assert.equal(limitOf(w, 'A'), null, 'no Limit: the line alone');
+  ok(setLimit(w, 'A', 30n * M));
+  assert.equal(limitOf(w, 'A'), 30n * M);
+  failed(swap(w, 'A', 21n * M), /OverLimit/);
+  ok(swap(w, 'A', 20n * M));
+  failed(swap(w, 'A', 1n), /OverLimit/, 'its 30 swapped');
+  ok(deposit(w, w.holders.A, 5n * M));
+  failed(swapDeposited(w, 'A', 5n * M), /OverLimit/, 'a deposit stops there too');
+  ok(refund(w, w.holders.A, 5n * M));
+  // B has no Limit: its whole line.
+  ok(swap(w, 'B', 50n * M));
+  // The owner found A only moved its coins: the Limit set again, past the line, lifts it up to the line and no further.
+  ok(setLimit(w, 'A', 500n * M));
+  ok(swap(w, 'A', 70n * M));
+  failed(swap(w, 'A', 1n), /OverEntitled/);
+  assert.equal(tokens(w.svm, w.newOf(w.holders.A)), out(100n * M));
+});
+
+test('a Limit of nothing stops every swap of that wallet; a Limit under what it already swapped takes nothing back', () => {
+  const w = world();
+  opened(w);
+  ok(setLimit(w, 'C', 0n));
+  failed(swap(w, 'C', 1n), /OverLimit/);
+  ok(swap(w, 'B', 40n * M));
+  ok(setLimit(w, 'B', 10n * M));
+  failed(swap(w, 'B', 1n), /OverLimit/);
+  assert.equal(tokens(w.svm, w.newOf(w.holders.B)), out(40n * M), 'what it swapped stays');
+});
+
+test('only the seller sets a Limit, and setting one moves no tokens', () => {
+  const w = world();
+  opened(w);
+  failed(setLimit(w, 'A', 0n, { operator: w.stranger }), /NotOperator/);
+  failed(setLimit(w, 'A', 0n, { operator: w.admin }), /NotOperator/);
+  failed(setLimit(w, 'A', 500n * M, { operator: w.holders.A }), /NotOperator/, 'not even the wallet itself');
+  failed(setLimit(w, 'A', 0n, { oldDestination: w.oldOf(w.holders.A) }), /WrongDestination|NotOperator/);
+  assert.equal(limitOf(w, 'A'), null);
+  const before = [tokens(w.svm, w.vault), tokens(w.svm, w.oldOf(w.holders.A)), tokens(w.svm, w.sellerOld)];
+  ok(setLimit(w, 'A', 5n * M));
+  assert.deepEqual([tokens(w.svm, w.vault), tokens(w.svm, w.oldOf(w.holders.A)), tokens(w.svm, w.sellerOld)], before);
+});
+
+test('a swap must carry the holder\'s own Limit address last: left out, or another wallet\'s, it fails', () => {
+  const w = world();
+  opened(w);
+  ok(setLimit(w, 'A', 0n));
+  const ix = holder => swapInstruction({ ...mints(w), holder: w.holders.A.publicKey, oldTokenProgram: TOKEN_PROGRAM_ID, oldDestination: w.sellerOld, amount: M,
+    entitled: ENTITLED.A, proof: w.snap.proofOf(w.holders.A.publicKey) });
+  const without = ix(); without.keys.pop();
+  failed(send(w.svm, w.holders.A, [without]), /NotEnoughAccountKeys|not enough account keys/i);
+  const others = ix(); others.keys[others.keys.length - 1] = { pubkey: limitAddress(PROGRAM, w.config, w.holders.B.publicKey), isSigner: false, isWritable: false };
+  failed(send(w.svm, w.holders.A, [others]), /ConstraintSeeds|seeds constraint/i);
+  failed(send(w.svm, w.holders.A, [ix()]), /OverLimit/);
+});
+

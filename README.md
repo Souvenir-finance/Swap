@@ -25,6 +25,13 @@ for it, and the program checks every one.
   that holder: the same checks as `swap` (the holder's snapshot line and proof, its receipt's cap, the deadline, the vault), with the old tokens taken from
   the deposit account instead of the holder's, and the new ones paid to the holder's own account. What it cannot swap (past the holder's line, from a wallet
   outside the snapshot, after the deadline) it sends back with `refund_deposit(amount)`. Both only draw from the deposit account, and only the seller signs them.
+- Limits (added 2026-11-05): a wallet that sold or moved old tokens after the snapshot may swap only the lowest amount it held since. Without this, a
+  wallet could sell its old tokens after the snapshot, buy them back cheaper once the old coin's price fell, and still swap its whole snapshot line. The
+  chain keeps no past balances, so Souvenir's server watches every snapshot wallet's old tokens, and the seller writes a wallet's lowest with
+  `set_limit(kept)` into its Limit, the PDA `["limit", config, wallet]`. Every `swap` and `swap_deposited` passes the holder's Limit address as its last
+  account, and once a Limit exists, what the wallet has swapped in all must stay within it (`OverLimit`) as well as within its snapshot line. Setting it
+  again replaces it: the team raises it back when a wallet only moved its coins between its own wallets. It never lets a wallet past its snapshot line,
+  and it moves no tokens.
 
 The root, the rate, the deadline and both destinations are fixed by `initialize` and `open`; no instruction changes them.
 
@@ -32,6 +39,8 @@ The root, the rate, the deadline and both destinations are fixed by `initialize`
 
 - No instruction moves new tokens except `swap` and `swap_deposited` (to the holder, within its snapshot line) and `settle` (to `unclaimed_destination`).
   The admin has no withdraw, no pause and no way to change anything after `open`.
+- A Limit is the seller's word: the program does not check that `kept` is what the wallet really held at its lowest (the server's reading of the chain,
+  which anyone can repeat). The seller can stop a wallet's swaps with a Limit of nothing, but cannot give any wallet more than its snapshot line.
 - A transfer does not tell the program who sent it, so for a deposit the seller says whom to credit. It can only credit a wallet in the snapshot, within
   that wallet's line and to that wallet's own account, and never more than the deposit account holds. Deposited old tokens it does not swap, the seller
   sends wherever it names (`refund_deposit` takes any old-token account): Souvenir's keeper sends them back to the account they came from, but that is the
