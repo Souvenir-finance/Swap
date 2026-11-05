@@ -17,8 +17,8 @@ for it, and the program checks every one.
   checks both, and that everything the wallet has swapped (its receipt) stays within `entitled`. The old tokens go from the holder straight to
   `old_destination`. If the vault holds fewer new tokens than the swap pays, it fails whole (`VaultShort`): nothing moves, and the same swap goes through
   once the vault holds enough.
-- Adding to the vault takes no instruction: anyone can send new tokens to it with a plain token transfer. The vault opens with the team's dev buy, which
-  covers most of the snapshot, and the team tops it up if it runs low; its balance is public (the vault is the config's associated account of the new mint).
+- Adding to the vault takes no instruction: anyone can send new tokens to it with a plain token transfer (the vault is the config's associated account of
+  the new mint).
 - `settle()`: anyone, from the deadline on (2027-02-15 00:00 UTC, unix 1802649600). Every new token left in the vault goes to `unclaimed_destination`.
 - Sending instead of signing: a holder may send old tokens with a plain transfer to the swap's deposit address, the PDA `["deposit", config]`, which no key
   holds (its old-mint associated account takes them). Then the seller, the owner of `old_destination`, calls `swap_deposited(amount, entitled, proof)` for
@@ -39,7 +39,7 @@ The root, the rate, the deadline and both destinations are fixed by `initialize`
 - The program never holds old tokens and has no say in what happens to them afterwards. The seller sells them into the old pool and the team's costs
   are repaid from the proceeds (announced separately, with a public ledger on /migrate).
 - It does not check that the snapshot is honest. The root is the admin's input; the snapshot is checkable against the chain (below).
-- It does not make anyone fill the vault. A swap it cannot pay waits for a top-up; the rate never changes.
+- It does not make anyone fill the vault, and the rate never changes.
 - It does not decide what happens to the unclaimed tokens after `settle`. The team announces that separately.
 
 ## The program is upgradeable
